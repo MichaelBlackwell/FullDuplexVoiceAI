@@ -3,8 +3,8 @@
 ## Design Document & Development Roadmap
 
 **Author:** Solo project
-**Status:** Phase 2 complete (Listening). Phase 3 next (Thinking).
-**Last updated:** April 9, 2026
+**Status:** Phase 5 complete (Interruptions). Phase 6 next (Production Hardening).
+**Last updated:** April 10, 2026
 
 ---
 
@@ -352,7 +352,7 @@ Faster-Whisper `medium` model uses ~2GB VRAM. Kokoro runs on CPU by default. Thi
 
 ---
 
-### Phase 3: Thinking (Weeks 5–6)
+### Phase 3: Thinking (Weeks 5–6) -- COMPLETE
 
 **Goal:** The system generates intelligent responses to what the user says.
 
@@ -371,9 +371,15 @@ Faster-Whisper `medium` model uses ~2GB VRAM. Kokoro runs on CPU by default. Thi
 
 **Deliverable:** Type text into a console, get a streaming text response. Then wire it up: speak into browser → see transcript → see streaming LLM response in real time.
 
+**Implementation notes:**
+- `LLMClient` wraps `AsyncOpenAI` with configurable base URL, model, and API key. Shared singleton across sessions.
+- `SentenceChunker` buffers streaming tokens: first chunk emits at clause boundary (comma) for minimum latency, subsequent chunks batch at sentence boundaries (`.!?:`). This feeds directly into TTS.
+- `ConversationManager` tracks per-session history with `played_text` vs `generated_text` for interruption-aware context. Uses LLM-based summarization (not truncation) when history exceeds 40 messages.
+- Stream cancellation via `asyncio.Event` per session — new user transcript sets the event, which aborts the in-progress SSE stream and records partial output.
+
 ---
 
-### Phase 4: Speaking (Weeks 7–8)
+### Phase 4: Speaking (Weeks 7–8) -- COMPLETE
 
 **Goal:** The AI responds with natural-sounding voice.
 
@@ -397,9 +403,17 @@ Faster-Whisper `medium` model uses ~2GB VRAM. Kokoro runs on CPU by default. Thi
 
 **Deliverable:** Have a voice conversation with the AI. It listens, thinks, and speaks. No interruption support yet — pure turn-taking.
 
+**Implementation notes:**
+- `KokoroTTS` is a shared singleton (like `WhisperTranscriber`) loaded eagerly at server startup. Uses a single-worker `ThreadPoolExecutor` to serialize CPU-bound Kokoro inference across sessions.
+- `TTSSpeaker` is a per-session two-stage pipeline: (1) a synthesizer task pulls text from a queue, runs Kokoro, resamples 24kHz→48kHz via one-shot `soxr.resample`, and pushes 20ms AudioFrames into an intermediate buffer; (2) a pusher task feeds frames from the buffer to the WebRTC output queue at real-time pace via blocking `await put()`. This decoupled design lets synthesis run ahead of playback — sentence N+1 is synthesized while sentence N is still playing, eliminating inter-sentence gaps.
+- TTS output bypasses the `AudioProcessor` pipeline chain. The `PipelineRunner` exposes its `output_queue` property, and `connection.py` feeds TTS frames directly into it from the LLM response path. This is architecturally clean because the listening pipeline (audio in → processors) and speaking path (text in → TTS → audio out) are independent concurrent streams.
+- `OutputAudioTrack.recv()` uses `asyncio.wait_for` with a 20ms timeout. On timeout, it emits a silence frame (960 zero samples at 48kHz) to keep the RTP stream alive and prevent WebRTC track drops during inter-sentence gaps or before TTS output begins.
+- Barge-in cancellation already wired: when `send_transcript` fires (user spoke), it cancels the LLM task and calls `TTSSpeaker.cancel()` which sets a cancel event and drains the text queue, intermediate frame queue, and output audio queue.
+- Voice is configurable via `TTS_VOICE` environment variable. Default `af_heart`. All available Kokoro voices listed in `.env.example`.
+
 ---
 
-### Phase 5: Interruptions (Weeks 9–10)
+### Phase 5: Interruptions (Weeks 9–10) -- COMPLETE
 
 **Goal:** Full-duplex conversation with natural barge-in support.
 
@@ -410,7 +424,7 @@ Faster-Whisper `medium` model uses ~2GB VRAM. Kokoro runs on CPU by default. Thi
   2. Clear the Kokoro text-chunk queue.
   3. Cancel any in-progress Kokoro synthesis (cancel the thread pool future).
   4. Clear the outbound audio buffer.
-  5. Stop audio playback on the client (send a control message via DataChannel).
+  5. Stop audio playback on the client (send a control message via WebSocket).
   6. Transition to `LISTENING` state.
   7. Record partial AI response in conversation history.
 - Handle false barge-ins: brief coughs, background noise, the user saying "uh-huh" as a backchannel. Options: require minimum speech duration (e.g., 300ms) before triggering interrupt, or use energy threshold in addition to VAD.
@@ -427,6 +441,17 @@ Faster-Whisper `medium` model uses ~2GB VRAM. Kokoro runs on CPU by default. Thi
 - Investigate speculative execution: start Faster-Whisper transcription on partial audio (before end-of-speech) and update if more speech arrives.
 
 **Deliverable:** Have a natural conversation where you can interrupt the AI mid-sentence. It stops, listens, and responds to your interruption. Measure and log voice-to-voice latency for every turn.
+
+**Implementation notes:**
+- **Explicit session state machine:** New `SessionState` class (`server/session.py`) tracks per-session phase: IDLE → LISTENING → THINKING → SPEAKING. Replaces the implicit state previously derived from task lifecycle. Used by barge-in detection to know whether user speech is an interruption.
+- **True barge-in on SPEECH_START:** `ListeningProcessor` now fires an `on_speech_start` callback when VAD detects speech, plus an `on_speech_audio` callback on every audio chunk during active speech. Previously, interruption only triggered on SPEECH_END (after user finished speaking). Now interruption triggers mid-utterance once the barge-in filter confirms it.
+- **Dual-threshold barge-in filter:** `BargeInFilter` (`server/pipeline/bargein.py`) requires both 300ms of continuous speech AND average RMS energy above a configurable threshold before confirming a barge-in. This filters false positives from coughs, background noise, and brief backchannel utterances like "uh-huh". Both thresholds are configurable via `barge_in_min_duration_ms` and `barge_in_min_energy` settings.
+- **Idempotent `_execute_barge_in`:** Centralized async function in `connection.py` that cancels LLM streaming, drains all TTS queues, sends a `stop_playback` WebSocket message to the client, and transitions session to LISTENING. Safe to call multiple times — cancelling an already-cancelled task or draining empty queues are no-ops. Both the barge-in filter trigger and `send_transcript` (SPEECH_END) call this same function.
+- **Client-side playback stop:** WebSocket `stop_playback` message causes the browser to briefly mute the `<audio>` element (100ms) to flush the WebRTC jitter buffer of stale audio, then unmute for new audio. The response display is marked with "[interrupted]".
+- **Per-utterance latency instrumentation:** `UtteranceTimings` (`server/metrics.py`) records `time.perf_counter()` timestamps at every pipeline stage: speech_start, speech_end, stt_start, stt_end, llm_first_token, llm_done, tts_first_chunk_done, first_frame_to_client. Voice-to-voice latency = speech_end → first_frame_to_client. `LatencyTracker` computes rolling P50/P95/P99 percentiles and logs per-utterance breakdowns.
+- **TTS first-frame callback:** `TTSSpeaker` now accepts an `on_first_frame` callback that fires once per response cycle when the first audio frame is pushed to the WebRTC output queue. Used to record `first_frame_to_client` timestamp for V2V latency calculation.
+- **Config knobs for optimization:** `tts_device` setting (env: `TTS_DEVICE`, default "cpu") allows switching Kokoro to GPU. `stt_model_size` already existed for Whisper model switching. Speculative STT execution deferred to future work.
+- **Conversation history tracks interruptions:** On barge-in cancellation, the full LLM-generated text (including unplayed portions) is recorded via `ConversationManager.add_assistant_message()`. The `was_interrupted` flag is set so the LLM has context about what was cut off.
 
 ---
 

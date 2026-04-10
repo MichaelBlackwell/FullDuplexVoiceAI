@@ -8,6 +8,7 @@ that pulls text chunks from a queue, synthesizes audio, resamples to
 
 import asyncio
 import logging
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -45,14 +46,16 @@ class KokoroTTS:
             self._executor, self._load_pipeline
         )
         logger.info(
-            "KokoroTTS started: lang=%s", settings.tts_language
+            "KokoroTTS started: lang=%s, device=%s",
+            settings.tts_language,
+            settings.tts_device,
         )
 
     @staticmethod
     def _load_pipeline():
         from kokoro import KPipeline
 
-        return KPipeline(lang_code=settings.tts_language)
+        return KPipeline(lang_code=settings.tts_language, device=settings.tts_device)
 
     def _synthesize_sync(self, text: str, voice: str) -> np.ndarray:
         """Run Kokoro synthesis (CPU-bound, called in thread pool).
@@ -88,6 +91,9 @@ class KokoroTTS:
         logger.info("KokoroTTS stopped")
 
 
+_DONE_SENTINEL = object()  # Signals end of a response cycle (not end of speaker)
+
+
 class TTSSpeaker:
     """Per-session TTS speaker with two-stage pipeline.
 
@@ -106,10 +112,14 @@ class TTSSpeaker:
         tts: KokoroTTS,
         output_queue: asyncio.Queue[AudioFrame],
         voice: str | None = None,
+        on_first_frame: Callable[[], None] | None = None,
+        on_playback_done: Callable[[], None] | None = None,
     ) -> None:
         self._tts = tts
         self._output_queue = output_queue
         self._voice = voice or settings.tts_voice
+        self._on_first_frame = on_first_frame
+        self._on_playback_done = on_playback_done
         self._text_queue: asyncio.Queue[str | None] = asyncio.Queue()
         # Intermediate buffer between synthesis and playback.
         # Large enough to hold a few sentences worth of pre-synthesized frames.
@@ -119,6 +129,7 @@ class TTSSpeaker:
         self._cancel_event = asyncio.Event()
         self._synth_task: asyncio.Task | None = None
         self._push_task: asyncio.Task | None = None
+        self._first_frame_fired = False
 
     async def start(self) -> None:
         self._synth_task = asyncio.create_task(self._synthesizer())
@@ -127,6 +138,15 @@ class TTSSpeaker:
     async def enqueue(self, text: str) -> None:
         """Add a text chunk for synthesis."""
         await self._text_queue.put(text)
+
+    async def enqueue_done(self) -> None:
+        """Signal that no more text is coming for this response cycle.
+
+        A done sentinel flows through both pipeline stages. When the pusher
+        processes it (after all preceding audio frames), it fires the
+        on_playback_done callback — the correct time to mark the session idle.
+        """
+        await self._text_queue.put(_DONE_SENTINEL)
 
     def cancel(self) -> None:
         """Interrupt current speech: clear all queues, abort synthesis."""
@@ -137,15 +157,25 @@ class TTSSpeaker:
         _drain(self._frame_queue)
         # Drain output audio queue (unblocks pusher if blocked on put)
         _drain(self._output_queue)
+        # Reset first-frame tracking for next response cycle
+        self._first_frame_fired = False
+
+    def reset_first_frame(self) -> None:
+        """Reset first-frame tracking for a new response cycle."""
+        self._first_frame_fired = False
 
     async def _synthesizer(self) -> None:
         """Stage 1: text → synthesis → resampled frames into intermediate queue."""
         while True:
             text = await self._text_queue.get()
             if text is None:
-                # Signal pusher to stop
+                # Signal pusher to stop entirely
                 await self._frame_queue.put(None)
                 break
+            if text is _DONE_SENTINEL:
+                # Forward done sentinel to pusher (don't stop the task)
+                await self._frame_queue.put(_DONE_SENTINEL)
+                continue
 
             self._cancel_event.clear()
 
@@ -174,9 +204,25 @@ class TTSSpeaker:
             frame = await self._frame_queue.get()
             if frame is None:
                 break
+            if frame is _DONE_SENTINEL:
+                # All audio for this response has been pushed to the output queue
+                if self._on_playback_done:
+                    try:
+                        self._on_playback_done()
+                    except Exception:
+                        logger.exception("on_playback_done callback failed")
+                continue
             if self._cancel_event.is_set():
                 continue
             await self._output_queue.put(frame)
+
+            # Fire on_first_frame callback once per response cycle
+            if not self._first_frame_fired and self._on_first_frame:
+                self._first_frame_fired = True
+                try:
+                    self._on_first_frame()
+                except Exception:
+                    logger.exception("on_first_frame callback failed")
 
     async def stop(self) -> None:
         """Signal both tasks to exit and wait for them."""

@@ -1,13 +1,17 @@
 import asyncio
 import logging
+import time
 from contextlib import suppress
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from server.llm.client import LLMClient
 from server.llm.conversation import ConversationManager
+from server.metrics import LatencyTracker
+from server.pipeline.bargein import BargeInFilter
 from server.pipeline.listening import ListeningProcessor
 from server.pipeline.runner import PipelineRunner
+from server.session import SessionState
 from server.stt.transcriber import WhisperTranscriber
 from server.tts.synthesizer import KokoroTTS, TTSSpeaker
 
@@ -27,6 +31,9 @@ _conversations: dict[int, ConversationManager] = {}
 _llm_tasks: dict[int, asyncio.Task] = {}
 _cancel_events: dict[int, asyncio.Event] = {}
 _tts_speakers: dict[int, TTSSpeaker] = {}
+_session_states: dict[int, SessionState] = {}
+_barge_in_filters: dict[int, BargeInFilter] = {}
+_latency_trackers: dict[int, LatencyTracker] = {}
 
 
 async def _get_transcriber() -> WhisperTranscriber:
@@ -61,6 +68,38 @@ async def preload_tts() -> None:
     await _get_tts_engine()
 
 
+async def _execute_barge_in(pc_id: int) -> None:
+    """Execute a confirmed barge-in: stop LLM, TTS, flush audio, notify client.
+
+    Idempotent — safe to call multiple times or when nothing is active.
+    """
+    from server.signaling import transcript_queues
+
+    session_state = _session_states.get(pc_id)
+    if session_state:
+        session_state.mark_listening()
+
+    # 1. Cancel LLM streaming
+    cancel_event = _cancel_events.get(pc_id)
+    if cancel_event:
+        cancel_event.set()
+    existing_task = _llm_tasks.get(pc_id)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await existing_task
+
+    # 2-4. Cancel TTS (clears text_queue, frame_queue, output_queue)
+    speaker = _tts_speakers.get(pc_id)
+    if speaker:
+        speaker.cancel()
+
+    # 5. Send stop_playback to client via WebSocket
+    queue = transcript_queues.get(pc_id)
+    if queue:
+        await queue.put({"type": "stop_playback"})
+
+
 async def create_peer_connection(
     offer_sdp: str, offer_type: str
 ) -> tuple[RTCSessionDescription, int]:
@@ -89,9 +128,37 @@ async def create_peer_connection(
             # Import here to avoid circular import
             from server.signaling import transcript_queues
 
-            # Create per-session conversation manager
+            # Create per-session state objects
             conversation = ConversationManager()
             _conversations[pc_id] = conversation
+
+            session_state = SessionState()
+            _session_states[pc_id] = session_state
+
+            barge_in_filter = BargeInFilter()
+            _barge_in_filters[pc_id] = barge_in_filter
+
+            latency_tracker = LatencyTracker()
+            _latency_trackers[pc_id] = latency_tracker
+
+            # --- Callbacks for ListeningProcessor ---
+
+            async def on_speech_start() -> None:
+                """Called when VAD detects speech start."""
+                barge_in_filter.on_speech_start()
+                session_state.mark_listening()
+
+            def on_speech_audio(audio_16k) -> None:
+                """Called synchronously with each audio chunk during speech.
+
+                If barge-in filter triggers AND session is AI-active,
+                schedule async barge-in execution.
+                """
+                if session_state.is_ai_active and barge_in_filter.on_speech_audio(
+                    audio_16k
+                ):
+                    logger.info("Barge-in triggered for peer %s", pc_id)
+                    asyncio.ensure_future(_execute_barge_in(pc_id))
 
             async def send_transcript(text: str) -> None:
                 logger.info("Transcript [peer %s]: %s", pc_id, text)
@@ -99,19 +166,9 @@ async def create_peer_connection(
                 if queue:
                     await queue.put({"type": "transcript", "text": text})
 
-                # Cancel any in-progress LLM response and TTS for this peer
-                existing_task = _llm_tasks.get(pc_id)
-                if existing_task and not existing_task.done():
-                    cancel_event = _cancel_events.get(pc_id)
-                    if cancel_event:
-                        cancel_event.set()
-                    existing_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await existing_task
-
-                speaker = _tts_speakers.get(pc_id)
-                if speaker:
-                    speaker.cancel()
+                # Cancel any in-progress response (reuses barge-in logic)
+                await _execute_barge_in(pc_id)
+                barge_in_filter.reset()
 
                 # Trigger LLM response
                 conversation.add_user_message(text)
@@ -125,6 +182,9 @@ async def create_peer_connection(
             processor = ListeningProcessor(
                 on_transcript=send_transcript,
                 transcriber=None,  # Will be set during start
+                on_speech_start=on_speech_start,
+                on_speech_audio=on_speech_audio,
+                latency_tracker=latency_tracker,
             )
             pipeline = PipelineRunner(
                 input_track=track,
@@ -163,7 +223,29 @@ async def _start_pipeline(
     await _get_llm_client()  # Pre-warm so first LLM call is fast
 
     tts_engine = await _get_tts_engine()
-    speaker = TTSSpeaker(tts=tts_engine, output_queue=pipeline.output_queue)
+
+    # on_first_frame callback records latency timestamp
+    def on_first_frame() -> None:
+        tracker = _latency_trackers.get(pc_id)
+        if tracker and tracker.current:
+            now = time.perf_counter()
+            tracker.current.first_frame_to_client = now
+            if tracker.current.tts_first_chunk_done == 0.0:
+                tracker.current.tts_first_chunk_done = now
+
+    # on_playback_done fires after all audio for a response has been pushed
+    def on_playback_done() -> None:
+        session_state = _session_states.get(pc_id)
+        if session_state and session_state.is_speaking:
+            session_state.mark_idle()
+            logger.info("TTS playback done for peer %s, session now IDLE", pc_id)
+
+    speaker = TTSSpeaker(
+        tts=tts_engine,
+        output_queue=pipeline.output_queue,
+        on_first_frame=on_first_frame,
+        on_playback_done=on_playback_done,
+    )
     await speaker.start()
     _tts_speakers[pc_id] = speaker
 
@@ -182,6 +264,18 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
     _cancel_events[pc_id] = cancel_event
     accumulated = ""  # Track partial response for cancellation
 
+    session_state = _session_states.get(pc_id)
+    if session_state:
+        session_state.mark_thinking()
+
+    tracker = _latency_trackers.get(pc_id)
+    first_chunk_received = False
+
+    # Reset first-frame tracking on the TTS speaker for this response cycle
+    speaker = _tts_speakers.get(pc_id)
+    if speaker:
+        speaker.reset_first_frame()
+
     try:
         llm_client = await _get_llm_client()
         messages = conversation.get_messages()
@@ -190,11 +284,20 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
         )
 
         async def on_chunk(chunk: str) -> None:
-            nonlocal accumulated
+            nonlocal accumulated, first_chunk_received
             accumulated += chunk
             await queue.put({"type": "llm_chunk", "text": chunk})
+
+            # Record first token time for latency tracking
+            if not first_chunk_received:
+                first_chunk_received = True
+                if tracker and tracker.current:
+                    tracker.current.llm_first_token = time.perf_counter()
+                # Mark session as speaking on first TTS enqueue
+                if session_state:
+                    session_state.mark_speaking()
+
             # Feed sentence chunk to TTS for audio synthesis
-            speaker = _tts_speakers.get(pc_id)
             if speaker:
                 await speaker.enqueue(chunk)
 
@@ -204,12 +307,25 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
             cancel_event=cancel_event,
         )
 
+        # Record LLM completion time
+        if tracker and tracker.current:
+            tracker.current.llm_done = time.perf_counter()
+
         await queue.put({"type": "llm_done"})
         conversation.add_assistant_message(full_response)
         logger.info(
             "LLM response complete [peer %s]: %d chars, history now %d messages",
             pc_id, len(full_response), conversation.message_count,
         )
+
+        # Signal TTS that no more text is coming. The session transitions
+        # to IDLE only after TTS finishes playing all audio (via on_playback_done).
+        if speaker:
+            await speaker.enqueue_done()
+
+        # Finalize latency tracking
+        if tracker:
+            tracker.finalize()
 
         # Check if summarization is needed
         await conversation.maybe_summarize(llm_client)
@@ -219,9 +335,18 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
         # Record partial response so conversation history stays coherent
         if accumulated:
             conversation.add_assistant_message(accumulated)
+        # Mark as interrupted for latency tracking
+        if tracker and tracker.current:
+            tracker.current.was_interrupted = True
+            tracker.current.llm_done = time.perf_counter()
+            tracker.finalize()
         await queue.put({"type": "llm_done"})
     except Exception:
         logger.exception("LLM response failed for peer %s", pc_id)
+        if session_state:
+            session_state.mark_idle()
+        if tracker:
+            tracker.finalize()
         await queue.put({"type": "llm_done"})
 
 
@@ -247,6 +372,9 @@ async def _cleanup_connection(pc: RTCPeerConnection) -> None:
     if pipeline:
         await pipeline.stop()
     _conversations.pop(pc_id, None)
+    _session_states.pop(pc_id, None)
+    _barge_in_filters.pop(pc_id, None)
+    _latency_trackers.pop(pc_id, None)
     _peer_connections.discard(pc)
     await pc.close()
     # Clean up transcript queue

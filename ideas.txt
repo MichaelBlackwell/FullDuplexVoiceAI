@@ -1,0 +1,3 @@
+These are just ideas. do not implement or read this yet
+
+Use the Qwen 3 TTS model and give it personality

@@ -61,6 +61,13 @@ class Settings:
     tts_voice: str = field(
         default_factory=lambda: os.environ.get("TTS_VOICE", "af_heart")
     )
+    tts_device: str = field(
+        default_factory=lambda: os.environ.get("TTS_DEVICE", "cpu")
+    )
+
+    # Barge-in settings
+    barge_in_min_duration_ms: int = 300  # min speech duration before triggering interrupt
+    barge_in_min_energy: float = 200.0  # min RMS (int16 scale) to confirm barge-in
 
 
 settings = Settings()

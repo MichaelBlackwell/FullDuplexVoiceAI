@@ -128,6 +128,9 @@ function connectTranscriptWs() {
                 case "llm_done":
                     finalizeResponse();
                     break;
+                case "stop_playback":
+                    handleStopPlayback();
+                    break;
             }
         } catch (e) {
             console.error("Failed to parse message:", e);
@@ -198,6 +201,22 @@ function appendResponseChunk(text) {
 
 function finalizeResponse() {
     currentResponseEl = null;
+}
+
+function handleStopPlayback() {
+    // Briefly mute to clear the browser's jitter buffer of stale audio
+    const audioEl = document.getElementById("remote-audio");
+    if (audioEl) {
+        audioEl.muted = true;
+        setTimeout(() => {
+            audioEl.muted = false;
+        }, 100);
+    }
+    // Mark current response as interrupted in the UI
+    if (currentResponseEl) {
+        currentResponseEl.textContent += " [interrupted]";
+        currentResponseEl = null;
+    }
 }
 
 // Simple latency estimation using the WebRTC stats API
