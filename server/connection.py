@@ -9,6 +9,7 @@ from server.llm.conversation import ConversationManager
 from server.pipeline.listening import ListeningProcessor
 from server.pipeline.runner import PipelineRunner
 from server.stt.transcriber import WhisperTranscriber
+from server.tts.synthesizer import KokoroTTS, TTSSpeaker
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +20,13 @@ _pipelines: dict[int, PipelineRunner] = {}
 # Shared singletons (loaded on first connection)
 _transcriber: WhisperTranscriber | None = None
 _llm_client: LLMClient | None = None
+_tts_engine: KokoroTTS | None = None
 
 # Per-session state
 _conversations: dict[int, ConversationManager] = {}
 _llm_tasks: dict[int, asyncio.Task] = {}
 _cancel_events: dict[int, asyncio.Event] = {}
+_tts_speakers: dict[int, TTSSpeaker] = {}
 
 
 async def _get_transcriber() -> WhisperTranscriber:
@@ -42,6 +45,20 @@ async def _get_llm_client() -> LLMClient:
         _llm_client = LLMClient()
         await _llm_client.start()
     return _llm_client
+
+
+async def _get_tts_engine() -> KokoroTTS:
+    """Get or create the shared KokoroTTS singleton."""
+    global _tts_engine
+    if _tts_engine is None:
+        _tts_engine = KokoroTTS()
+        await _tts_engine.start()
+    return _tts_engine
+
+
+async def preload_tts() -> None:
+    """Eagerly load the TTS engine at server startup."""
+    await _get_tts_engine()
 
 
 async def create_peer_connection(
@@ -82,7 +99,7 @@ async def create_peer_connection(
                 if queue:
                     await queue.put({"type": "transcript", "text": text})
 
-                # Cancel any in-progress LLM response for this peer
+                # Cancel any in-progress LLM response and TTS for this peer
                 existing_task = _llm_tasks.get(pc_id)
                 if existing_task and not existing_task.done():
                     cancel_event = _cancel_events.get(pc_id)
@@ -91,6 +108,10 @@ async def create_peer_connection(
                     existing_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await existing_task
+
+                speaker = _tts_speakers.get(pc_id)
+                if speaker:
+                    speaker.cancel()
 
                 # Trigger LLM response
                 conversation.add_user_message(text)
@@ -115,7 +136,7 @@ async def create_peer_connection(
             pc.addTrack(pipeline.output_track)
 
             # Start pipeline asynchronously (loads transcriber if needed)
-            asyncio.ensure_future(_start_pipeline(processor, pipeline))
+            asyncio.ensure_future(_start_pipeline(processor, pipeline, pc_id))
 
         @track.on("ended")
         async def on_ended():
@@ -133,11 +154,19 @@ async def create_peer_connection(
     return pc.localDescription, pc_id
 
 
-async def _start_pipeline(processor: ListeningProcessor, pipeline: PipelineRunner) -> None:
-    """Load the transcriber, pre-warm the LLM client, and start the pipeline."""
+async def _start_pipeline(
+    processor: ListeningProcessor, pipeline: PipelineRunner, pc_id: int
+) -> None:
+    """Load the transcriber, pre-warm the LLM client, create TTS speaker, and start the pipeline."""
     transcriber = await _get_transcriber()
     processor._transcriber = transcriber
     await _get_llm_client()  # Pre-warm so first LLM call is fast
+
+    tts_engine = await _get_tts_engine()
+    speaker = TTSSpeaker(tts=tts_engine, output_queue=pipeline.output_queue)
+    await speaker.start()
+    _tts_speakers[pc_id] = speaker
+
     await pipeline.start()
 
 
@@ -164,6 +193,10 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
             nonlocal accumulated
             accumulated += chunk
             await queue.put({"type": "llm_chunk", "text": chunk})
+            # Feed sentence chunk to TTS for audio synthesis
+            speaker = _tts_speakers.get(pc_id)
+            if speaker:
+                await speaker.enqueue(chunk)
 
         full_response = await llm_client.stream_completion(
             messages=messages,
@@ -206,6 +239,10 @@ async def _cleanup_connection(pc: RTCPeerConnection) -> None:
         with suppress(asyncio.CancelledError):
             await llm_task
 
+    speaker = _tts_speakers.pop(pc_id, None)
+    if speaker:
+        await speaker.stop()
+
     pipeline = _pipelines.pop(pc_id, None)
     if pipeline:
         await pipeline.stop()
@@ -220,7 +257,12 @@ async def _cleanup_connection(pc: RTCPeerConnection) -> None:
 
 async def shutdown_all() -> None:
     """Close all active peer connections. Called on server shutdown."""
+    global _tts_engine
     logger.info("Shutting down %d peer connection(s)", len(_peer_connections))
     coros = [_cleanup_connection(pc) for pc in list(_peer_connections)]
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
+
+    if _tts_engine:
+        await _tts_engine.stop()
+        _tts_engine = None

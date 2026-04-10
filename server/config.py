@@ -56,5 +56,11 @@ class Settings:
     llm_context_max_messages: int = 40
     llm_context_keep_recent: int = 6
 
+    # TTS settings
+    tts_language: str = "a"  # Kokoro lang code: "a" = American English
+    tts_voice: str = field(
+        default_factory=lambda: os.environ.get("TTS_VOICE", "af_heart")
+    )
+
 
 settings = Settings()

@@ -6,7 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from server.connection import create_peer_connection, shutdown_all
+from server.connection import create_peer_connection, preload_tts, shutdown_all
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,12 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    @app.on_event("startup")
+    async def on_startup():
+        logger.info("Pre-loading TTS engine...")
+        await preload_tts()
+        logger.info("TTS engine ready")
 
     @app.on_event("shutdown")
     async def on_shutdown():

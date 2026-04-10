@@ -36,6 +36,10 @@ class PipelineRunner:
     def output_track(self) -> OutputAudioTrack:
         return self._output_track
 
+    @property
+    def output_queue(self) -> asyncio.Queue:
+        return self._output_queue
+
     async def run(self) -> None:
         """Main processing loop."""
         for proc in self._processors:
