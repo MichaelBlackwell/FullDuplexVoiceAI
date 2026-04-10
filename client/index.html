@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Full-Duplex Voice AI — Live Transcription</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            text-align: center;
+            max-width: 600px;
+            width: 100%;
+            padding: 2rem;
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+            color: #f8fafc;
+        }
+        .subtitle {
+            font-size: 0.875rem;
+            color: #94a3b8;
+            margin-bottom: 2rem;
+        }
+        .status {
+            display: inline-block;
+            padding: 0.375rem 1rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            margin-bottom: 1.5rem;
+        }
+        .status.disconnected { background: #1e293b; color: #64748b; }
+        .status.connecting { background: #1e3a5f; color: #60a5fa; }
+        .status.connected { background: #14532d; color: #4ade80; }
+        .status.failed { background: #450a0a; color: #f87171; }
+        .buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-bottom: 2rem;
+        }
+        button {
+            padding: 0.75rem 2rem;
+            border: none;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.15s;
+        }
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        #btn-connect {
+            background: #3b82f6;
+            color: white;
+        }
+        #btn-disconnect {
+            background: #374151;
+            color: #d1d5db;
+        }
+        .latency {
+            font-size: 0.875rem;
+            color: #94a3b8;
+        }
+        .latency span {
+            color: #e2e8f0;
+            font-weight: 600;
+        }
+        .transcript-area {
+            margin-top: 2rem;
+            text-align: left;
+        }
+        .transcript-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            margin-bottom: 0.5rem;
+        }
+        .transcripts {
+            background: #1e293b;
+            border-radius: 0.5rem;
+            padding: 1rem;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 0.875rem;
+            line-height: 1.6;
+        }
+        .transcripts:empty::after {
+            content: "Transcripts will appear here...";
+            color: #475569;
+            font-style: italic;
+        }
+        .transcript-line {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #2d3a4f;
+        }
+        .transcript-line:last-child {
+            border-bottom: none;
+        }
+        .transcript-time {
+            color: #64748b;
+            font-size: 0.75rem;
+            margin-right: 0.5rem;
+        }
+        .response-area {
+            margin-top: 1.5rem;
+            text-align: left;
+        }
+        #ai-response {
+            background: #1e293b;
+            border-radius: 0.5rem;
+            padding: 1rem;
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 0.875rem;
+            line-height: 1.6;
+        }
+        #ai-response:empty::after {
+            content: "AI responses will appear here...";
+            color: #475569;
+            font-style: italic;
+        }
+        .response-line {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #2d3a4f;
+        }
+        .response-line:last-child {
+            border-bottom: none;
+        }
+        .response-text {
+            color: #93c5fd;
+        }
+        .hint {
+            margin-top: 1.5rem;
+            font-size: 0.75rem;
+            color: #475569;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Live Transcription</h1>
+        <p class="subtitle">Phase 3 — voice conversation with AI</p>
+
+        <div>
+            <span id="status" class="status disconnected">Disconnected</span>
+        </div>
+
+        <div class="buttons">
+            <button id="btn-connect" onclick="connect()">Connect</button>
+            <button id="btn-disconnect" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+
+        <p class="latency">Round-trip: <span id="latency">—</span></p>
+
+        <audio id="remote-audio" autoplay></audio>
+
+        <div class="transcript-area">
+            <p class="transcript-label">Transcripts</p>
+            <div id="transcripts" class="transcripts"></div>
+        </div>
+
+        <div class="response-area">
+            <p class="transcript-label">AI Response</p>
+            <div id="ai-response"></div>
+        </div>
+
+        <p class="hint">Speak into your microphone to converse with the AI</p>
+    </div>
+
+    <script src="client.js"></script>
+</body>
+</html>
