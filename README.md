@@ -65,6 +65,7 @@ Target was <500ms for STT inference alone -- achieved at 200-420ms after GPU war
 
 ```bash
 # Clone and enter the project
+git clone https://github.com/your-org/FullDuplexVoiceAI.git
 cd FullDuplexVoiceAI
 
 # Create and activate a virtual environment
