@@ -1,6 +1,6 @@
-"""Kokoro TTS integration — shared engine + per-session speaker.
+"""Qwen3-TTS integration — shared engine + per-session speaker.
 
-KokoroTTS is a singleton that loads the Kokoro model once and provides
+Qwen3TTS is a singleton that loads the Qwen3-TTS model once and provides
 async synthesis via a thread pool. TTSSpeaker is a per-session worker
 that pulls text chunks from a queue, synthesizes audio, resamples to
 48kHz, and pushes AudioFrames to the WebRTC output queue.
@@ -8,11 +8,14 @@ that pulls text chunks from a queue, synthesizes audio, resamples to
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 from av import AudioFrame
+from pydub import AudioSegment
 
 from server.audio.chunking import (
     chunk_duration_samples,
@@ -24,71 +27,113 @@ from server.config import settings
 
 logger = logging.getLogger(__name__)
 
+_OUTPUT_DIR = Path("output")
+_OUTPUT_DIR.mkdir(exist_ok=True)
+
 _WEBRTC_RATE = settings.audio_sample_rate_webrtc  # 48000
-_TTS_RATE = settings.audio_sample_rate_tts  # 24000
 _FRAME_MS = settings.audio_ptime_ms  # 20
 _FRAME_SAMPLES = chunk_duration_samples(_WEBRTC_RATE, _FRAME_MS)  # 960
 
 
-class KokoroTTS:
-    """Shared Kokoro TTS engine. Thread-safe for concurrent sessions
+class Qwen3TTS:
+    """Shared Qwen3-TTS engine. Thread-safe for concurrent sessions
     because inference is serialized through a single-worker thread pool.
     """
 
     def __init__(self) -> None:
-        self._pipeline = None
+        self._model = None
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._sample_rate: int = 0
 
     async def start(self) -> None:
-        """Load the Kokoro pipeline in the thread pool (can be slow)."""
+        """Load the Qwen3-TTS model in the thread pool (can be slow)."""
         loop = asyncio.get_running_loop()
-        self._pipeline = await loop.run_in_executor(
-            self._executor, self._load_pipeline
-        )
+        await loop.run_in_executor(self._executor, self._load_model)
         logger.info(
-            "KokoroTTS started: lang=%s, device=%s",
-            settings.tts_language,
+            "Qwen3TTS started: model=%s, device=%s",
+            settings.tts_model,
             settings.tts_device,
         )
 
-    @staticmethod
-    def _load_pipeline():
-        from kokoro import KPipeline
+    def _load_model(self):
+        import torch
+        from qwen_tts import Qwen3TTSModel
 
-        return KPipeline(lang_code=settings.tts_language, device=settings.tts_device)
+        self._model = Qwen3TTSModel.from_pretrained(
+            settings.tts_model,
+            device_map=settings.tts_device,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        logger.info(
+            "VRAM after TTS load: %.1f MB used",
+            torch.cuda.memory_allocated() / 1e6,
+        )
 
-    def _synthesize_sync(self, text: str, voice: str) -> np.ndarray:
-        """Run Kokoro synthesis (CPU-bound, called in thread pool).
+    def _synthesize_sync(
+        self, text: str, voice: str, language: str, instruct: str
+    ) -> np.ndarray:
+        """Run Qwen3-TTS synthesis (GPU-bound, called in thread pool).
 
-        Returns int16 ndarray at 24kHz.
+        Returns int16 ndarray at the model's native sample rate.
         """
-        chunks = []
-        for _graphemes, _phonemes, audio in self._pipeline(text, voice=voice):
-            if audio is not None:
-                chunks.append(audio)
+        wavs, sr = self._model.generate_custom_voice(
+            text=text,
+            language=language,
+            speaker=voice,
+            instruct=instruct if instruct else None,
+        )
+        self._sample_rate = sr
 
-        if not chunks:
+        if not wavs or len(wavs[0]) == 0:
             return np.array([], dtype=np.int16)
 
-        # Kokoro outputs float32 in [-1, 1] — concatenate then convert
-        audio_f32 = np.concatenate(chunks)
+        audio_f32 = wavs[0]
         audio_i16 = (audio_f32 * 32767).clip(-32768, 32767).astype(np.int16)
         return audio_i16
 
-    async def synthesize_async(self, text: str, voice: str) -> np.ndarray:
+    async def synthesize_async(
+        self,
+        text: str,
+        voice: str,
+        language: str = "English",
+        instruct: str = "",
+    ) -> np.ndarray:
         """Async wrapper — dispatches synthesis to thread pool.
 
-        Returns int16 ndarray at 24kHz.
+        Returns int16 ndarray at the model's native sample rate.
+        Saves the audio as an MP3 file in the output directory.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._synthesize_sync, text, voice
+        audio = await loop.run_in_executor(
+            self._executor, self._synthesize_sync, text, voice, language, instruct
         )
+        if len(audio) > 0:
+            await loop.run_in_executor(
+                None, self._save_mp3, audio, self._sample_rate
+            )
+        return audio
+
+    @staticmethod
+    def _save_mp3(audio: np.ndarray, sample_rate: int) -> None:
+        """Save int16 audio as MP3 to the output directory."""
+        seg = AudioSegment(
+            audio.tobytes(), frame_rate=sample_rate, sample_width=2, channels=1
+        )
+        filename = f"tts_{int(time.time() * 1000)}.mp3"
+        path = _OUTPUT_DIR / filename
+        seg.export(str(path), format="mp3")
+        logger.info("Saved TTS audio: %s", path)
+
+    @property
+    def sample_rate(self) -> int:
+        """Native sample rate of the model output (discovered after first synthesis)."""
+        return self._sample_rate or 12500
 
     async def stop(self) -> None:
         self._executor.shutdown(wait=False)
-        self._pipeline = None
-        logger.info("KokoroTTS stopped")
+        self._model = None
+        logger.info("Qwen3TTS stopped")
 
 
 _DONE_SENTINEL = object()  # Signals end of a response cycle (not end of speaker)
@@ -97,7 +142,7 @@ _DONE_SENTINEL = object()  # Signals end of a response cycle (not end of speaker
 class TTSSpeaker:
     """Per-session TTS speaker with two-stage pipeline.
 
-    Stage 1 (synthesizer): pulls text chunks, runs Kokoro synthesis,
+    Stage 1 (synthesizer): pulls text chunks, runs Qwen3-TTS synthesis,
     resamples to 48kHz, and pushes AudioFrames to an intermediate queue.
     This runs ahead of playback so the next sentence is ready before
     the current one finishes.
@@ -109,15 +154,19 @@ class TTSSpeaker:
 
     def __init__(
         self,
-        tts: KokoroTTS,
+        tts: Qwen3TTS,
         output_queue: asyncio.Queue[AudioFrame],
         voice: str | None = None,
+        language: str | None = None,
+        instruct: str | None = None,
         on_first_frame: Callable[[], None] | None = None,
         on_playback_done: Callable[[], None] | None = None,
     ) -> None:
         self._tts = tts
         self._output_queue = output_queue
         self._voice = voice or settings.tts_voice
+        self._language = language or settings.tts_language
+        self._instruct = instruct if instruct is not None else settings.tts_instruct
         self._on_first_frame = on_first_frame
         self._on_playback_done = on_playback_done
         self._text_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -130,6 +179,14 @@ class TTSSpeaker:
         self._synth_task: asyncio.Task | None = None
         self._push_task: asyncio.Task | None = None
         self._first_frame_fired = False
+
+    def set_voice(self, voice: str) -> None:
+        """Change voice for subsequent synthesis calls."""
+        self._voice = voice
+
+    def set_instruct(self, instruct: str) -> None:
+        """Change control instruction for subsequent synthesis calls."""
+        self._instruct = instruct
 
     async def start(self) -> None:
         self._synth_task = asyncio.create_task(self._synthesizer())
@@ -180,11 +237,14 @@ class TTSSpeaker:
             self._cancel_event.clear()
 
             try:
-                audio_24k = await self._tts.synthesize_async(text, self._voice)
-                if self._cancel_event.is_set() or len(audio_24k) == 0:
+                audio_native = await self._tts.synthesize_async(
+                    text, self._voice, self._language, self._instruct
+                )
+                if self._cancel_event.is_set() or len(audio_native) == 0:
                     continue
 
-                audio_48k = resample_audio(audio_24k, _TTS_RATE, _WEBRTC_RATE)
+                tts_rate = self._tts.sample_rate
+                audio_48k = resample_audio(audio_native, tts_rate, _WEBRTC_RATE)
 
                 chunks = split_into_chunks(audio_48k, _FRAME_SAMPLES)
                 for chunk in chunks:

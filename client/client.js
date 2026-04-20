@@ -1,5 +1,6 @@
 let pc = null;
 let localStream = null;
+let peerId = null;
 
 const statusEl = document.getElementById("status");
 const latencyEl = document.getElementById("latency");
@@ -71,6 +72,7 @@ async function connect() {
         }
 
         const answer = await response.json();
+        peerId = answer.peer_id;
         await pc.setRemoteDescription(answer);
 
         // Connect WebSocket for transcripts
@@ -151,6 +153,7 @@ function cleanup() {
         pc.close();
         pc = null;
     }
+    peerId = null;
     btnConnect.disabled = false;
     btnDisconnect.disabled = true;
     latencyEl.textContent = "—";
@@ -242,3 +245,59 @@ function startLatencyMeasurement() {
         }
     }, 1000);
 }
+
+// --- Settings Panel ---
+
+function toggleSettings() {
+    document.getElementById("settings-panel").classList.toggle("open");
+}
+
+async function loadDefaults() {
+    try {
+        const resp = await fetch("/settings/defaults");
+        const data = await resp.json();
+        const select = document.getElementById("voice-select");
+        select.innerHTML = "";
+        for (const v of data.voices) {
+            const opt = document.createElement("option");
+            opt.value = v;
+            opt.textContent = v;
+            if (v === data.default_voice) opt.selected = true;
+            select.appendChild(opt);
+        }
+        document.getElementById("tts-instruct").value = data.default_instruct || "";
+        document.getElementById("system-prompt").value = data.default_system_prompt || "";
+    } catch (e) {
+        console.error("Failed to load defaults:", e);
+    }
+}
+
+async function applySettings() {
+    if (!peerId) return;
+    const btn = document.getElementById("btn-apply");
+    try {
+        const resp = await fetch("/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                peer_id: peerId,
+                voice: document.getElementById("voice-select").value,
+                instruct: document.getElementById("tts-instruct").value,
+                system_prompt: document.getElementById("system-prompt").value,
+            }),
+        });
+        if (resp.ok) {
+            btn.classList.add("success");
+            btn.textContent = "Applied";
+            setTimeout(() => {
+                btn.classList.remove("success");
+                btn.textContent = "Apply Settings";
+            }, 1500);
+        }
+    } catch (e) {
+        console.error("Failed to apply settings:", e);
+    }
+}
+
+// Load defaults on page load
+loadDefaults();

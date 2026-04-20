@@ -11,11 +11,10 @@ from collections.abc import Awaitable, Callable
 from openai import AsyncOpenAI
 
 from server.config import settings
-from server.llm.chunker import SentenceChunker
 
 logger = logging.getLogger(__name__)
 
-ChunkCallback = Callable[[str], Awaitable[None]]
+TokenCallback = Callable[[str], Awaitable[None]]
 
 
 class LLMClient:
@@ -56,20 +55,19 @@ class LLMClient:
     async def stream_completion(
         self,
         messages: list[dict[str, str]],
-        on_chunk: ChunkCallback,
+        on_token: TokenCallback | None = None,
         cancel_event: asyncio.Event | None = None,
     ) -> str:
-        """Stream a chat completion, calling on_chunk at sentence boundaries.
+        """Stream a chat completion, calling on_token with each token as it arrives.
 
         Args:
             messages: Conversation history in OpenAI format.
-            on_chunk: Called with each sentence-chunked text segment.
+            on_token: Called with each token for real-time display.
             cancel_event: If set, streaming stops and partial output is returned.
 
         Returns:
             The complete generated text (all tokens concatenated).
         """
-        chunker = SentenceChunker()
         full_response = ""
 
         stream = await self._client.chat.completions.create(
@@ -80,25 +78,16 @@ class LLMClient:
             temperature=settings.llm_temperature,
         )
 
-        cancelled = False
         try:
             async for event in stream:
                 if cancel_event and cancel_event.is_set():
-                    cancelled = True
                     break
 
                 delta = event.choices[0].delta
                 if delta.content:
                     full_response += delta.content
-                    chunk = chunker.feed(delta.content)
-                    if chunk:
-                        await on_chunk(chunk)
-
-            # Flush remaining text
-            if not cancelled:
-                remaining = chunker.flush()
-                if remaining:
-                    await on_chunk(remaining)
+                    if on_token:
+                        await on_token(delta.content)
         finally:
             await stream.close()
 

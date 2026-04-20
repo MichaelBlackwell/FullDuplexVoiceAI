@@ -32,7 +32,7 @@ class Settings:
     vad_chunk_ms: int = 32  # Silero VAD requires 512 samples at 16kHz (32ms)
 
     # STT settings
-    stt_model_size: str = "medium"
+    stt_model_size: str = "small"
     stt_device: str = "cuda"
     stt_compute_type: str = "int8"
     stt_language: str = "en"
@@ -56,13 +56,21 @@ class Settings:
     llm_context_max_messages: int = 40
     llm_context_keep_recent: int = 6
 
-    # TTS settings
-    tts_language: str = "a"  # Kokoro lang code: "a" = American English
+    # TTS settings (Qwen3-TTS)
+    tts_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+        )
+    )
+    tts_language: str = "English"
     tts_voice: str = field(
-        default_factory=lambda: os.environ.get("TTS_VOICE", "af_heart")
+        default_factory=lambda: os.environ.get("TTS_VOICE", "ryan")
     )
     tts_device: str = field(
-        default_factory=lambda: os.environ.get("TTS_DEVICE", "cpu")
+        default_factory=lambda: os.environ.get("TTS_DEVICE", "cuda:0")
+    )
+    tts_instruct: str = field(
+        default_factory=lambda: os.environ.get("TTS_INSTRUCT", "")
     )
 
     # Barge-in settings
