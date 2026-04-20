@@ -6,14 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from server.connection import (
-    apply_session_settings,
-    create_peer_connection,
-    preload_tts,
-    shutdown_all,
-)
-from server.config import settings
-from server.llm.prompts import VOICE_SYSTEM_PROMPT
+from server.connection import create_peer_connection, preload_tts, shutdown_all
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +16,12 @@ CLIENT_DIR = Path(__file__).resolve().parent.parent / "client"
 class OfferRequest(BaseModel):
     sdp: str
     type: str
+    system_prompt: str | None = None
 
 
 class OfferResponse(BaseModel):
     sdp: str
     type: str
-    peer_id: int
 
 
 # Maps peer_id -> asyncio.Queue of message dicts
@@ -41,10 +34,12 @@ def create_app() -> FastAPI:
 
     @app.post("/offer", response_model=OfferResponse)
     async def offer(request: OfferRequest):
-        answer, peer_id = await create_peer_connection(request.sdp, request.type)
+        answer, peer_id = await create_peer_connection(
+            request.sdp, request.type, system_prompt=request.system_prompt
+        )
         # Create a transcript queue for this peer
         transcript_queues[peer_id] = asyncio.Queue()
-        return OfferResponse(sdp=answer.sdp, type=answer.type, peer_id=peer_id)
+        return OfferResponse(sdp=answer.sdp, type=answer.type)
 
     @app.websocket("/ws/transcripts")
     async def ws_transcripts(websocket: WebSocket):
@@ -67,35 +62,6 @@ def create_app() -> FastAPI:
                     await asyncio.sleep(0.5)
         except WebSocketDisconnect:
             logger.info("Transcript WebSocket disconnected")
-
-    # --- Settings API ---
-
-    AVAILABLE_VOICES = [
-        "ryan", "aiden", "vivian", "serena",
-        "uncle_fu", "dylan", "eric", "ono_anna", "sohee",
-    ]
-
-    @app.get("/settings/defaults")
-    async def get_defaults():
-        return {
-            "voices": AVAILABLE_VOICES,
-            "default_voice": settings.tts_voice,
-            "default_instruct": settings.tts_instruct,
-            "default_system_prompt": VOICE_SYSTEM_PROMPT,
-        }
-
-    class SettingsRequest(BaseModel):
-        peer_id: int
-        voice: str | None = None
-        instruct: str | None = None
-        system_prompt: str | None = None
-
-    @app.post("/settings")
-    async def update_settings(request: SettingsRequest):
-        result = apply_session_settings(
-            request.peer_id, request.voice, request.instruct, request.system_prompt
-        )
-        return {"status": "ok", **result}
 
     @app.get("/health")
     async def health():

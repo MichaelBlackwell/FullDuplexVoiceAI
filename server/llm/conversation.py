@@ -42,10 +42,6 @@ class ConversationManager:
         self._messages: list[MessageRecord] = []
         self._summary: str | None = None
 
-    def set_system_prompt(self, prompt: str) -> None:
-        """Update the system prompt for this session."""
-        self._system_prompt = prompt
-
     def add_user_message(self, text: str) -> None:
         """Record a user utterance."""
         self._messages.append(MessageRecord(role="user", content=text))

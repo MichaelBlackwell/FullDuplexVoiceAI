@@ -1,11 +1,55 @@
 let pc = null;
 let localStream = null;
-let peerId = null;
 
 const statusEl = document.getElementById("status");
 const latencyEl = document.getElementById("latency");
 const btnConnect = document.getElementById("btn-connect");
 const btnDisconnect = document.getElementById("btn-disconnect");
+
+// --- Settings ---
+const DEFAULT_SYSTEM_PROMPT =
+    "You are a helpful voice assistant in a real-time conversation. " +
+    "Keep responses concise and natural for spoken delivery. " +
+    "Use short sentences. Never use bullet points, numbered lists, " +
+    "markdown formatting, or emojis. Never spell out URLs. " +
+    "Respond as if you are speaking, not writing. " +
+    "If you don't know something, say so briefly.";
+
+const settingsModal = document.getElementById("settings-modal");
+const systemPromptEl = document.getElementById("system-prompt");
+
+function getSystemPrompt() {
+    return localStorage.getItem("systemPrompt") || DEFAULT_SYSTEM_PROMPT;
+}
+
+document.getElementById("btn-settings").addEventListener("click", () => {
+    systemPromptEl.value = getSystemPrompt();
+    settingsModal.classList.add("open");
+});
+
+document.getElementById("btn-modal-cancel").addEventListener("click", () => {
+    settingsModal.classList.remove("open");
+});
+
+document.getElementById("btn-modal-save").addEventListener("click", () => {
+    const value = systemPromptEl.value.trim();
+    if (value) {
+        localStorage.setItem("systemPrompt", value);
+    } else {
+        localStorage.removeItem("systemPrompt");
+    }
+    settingsModal.classList.remove("open");
+});
+
+document.getElementById("btn-modal-reset").addEventListener("click", () => {
+    systemPromptEl.value = DEFAULT_SYSTEM_PROMPT;
+    localStorage.removeItem("systemPrompt");
+});
+
+// Close modal on backdrop click
+settingsModal.addEventListener("click", (e) => {
+    if (e.target === settingsModal) settingsModal.classList.remove("open");
+});
 
 function setStatus(state, text) {
     statusEl.textContent = text || state;
@@ -64,6 +108,7 @@ async function connect() {
             body: JSON.stringify({
                 sdp: pc.localDescription.sdp,
                 type: pc.localDescription.type,
+                system_prompt: getSystemPrompt(),
             }),
         });
 
@@ -72,7 +117,6 @@ async function connect() {
         }
 
         const answer = await response.json();
-        peerId = answer.peer_id;
         await pc.setRemoteDescription(answer);
 
         // Connect WebSocket for transcripts
@@ -153,7 +197,6 @@ function cleanup() {
         pc.close();
         pc = null;
     }
-    peerId = null;
     btnConnect.disabled = false;
     btnDisconnect.disabled = true;
     latencyEl.textContent = "—";
@@ -245,59 +288,3 @@ function startLatencyMeasurement() {
         }
     }, 1000);
 }
-
-// --- Settings Panel ---
-
-function toggleSettings() {
-    document.getElementById("settings-panel").classList.toggle("open");
-}
-
-async function loadDefaults() {
-    try {
-        const resp = await fetch("/settings/defaults");
-        const data = await resp.json();
-        const select = document.getElementById("voice-select");
-        select.innerHTML = "";
-        for (const v of data.voices) {
-            const opt = document.createElement("option");
-            opt.value = v;
-            opt.textContent = v;
-            if (v === data.default_voice) opt.selected = true;
-            select.appendChild(opt);
-        }
-        document.getElementById("tts-instruct").value = data.default_instruct || "";
-        document.getElementById("system-prompt").value = data.default_system_prompt || "";
-    } catch (e) {
-        console.error("Failed to load defaults:", e);
-    }
-}
-
-async function applySettings() {
-    if (!peerId) return;
-    const btn = document.getElementById("btn-apply");
-    try {
-        const resp = await fetch("/settings", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                peer_id: peerId,
-                voice: document.getElementById("voice-select").value,
-                instruct: document.getElementById("tts-instruct").value,
-                system_prompt: document.getElementById("system-prompt").value,
-            }),
-        });
-        if (resp.ok) {
-            btn.classList.add("success");
-            btn.textContent = "Applied";
-            setTimeout(() => {
-                btn.classList.remove("success");
-                btn.textContent = "Apply Settings";
-            }, 1500);
-        }
-    } catch (e) {
-        console.error("Failed to apply settings:", e);
-    }
-}
-
-// Load defaults on page load
-loadDefaults();

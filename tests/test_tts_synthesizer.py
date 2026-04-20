@@ -1,7 +1,7 @@
-"""Unit tests for TTS synthesizer — TTSSpeaker with mocked Qwen3TTS."""
+"""Unit tests for TTS synthesizer — TTSSpeaker with mocked KokoroTTS."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -11,14 +11,13 @@ from server.tts.synthesizer import TTSSpeaker, _FRAME_SAMPLES, _WEBRTC_RATE
 
 
 def _make_mock_tts(duration_seconds: float = 0.1) -> MagicMock:
-    """Create a mock Qwen3TTS that returns synthetic audio at 12500Hz."""
+    """Create a mock KokoroTTS that returns synthetic audio at 24kHz."""
     tts = MagicMock()
-    sample_count = int(12500 * duration_seconds)
+    sample_count = int(24000 * duration_seconds)
     # Sine wave so we can verify it's not silence
     t = np.linspace(0, duration_seconds, sample_count, endpoint=False)
     audio = (np.sin(2 * np.pi * 440 * t) * 16000).astype(np.int16)
     tts.synthesize_async = AsyncMock(return_value=audio)
-    type(tts).sample_rate = PropertyMock(return_value=12500)
     return tts
 
 
@@ -27,7 +26,7 @@ class TestTTSSpeakerOutput:
     async def test_enqueue_produces_frames_in_output_queue(self):
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         tts = _make_mock_tts(duration_seconds=0.1)
-        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="Ryan")
+        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="af_heart")
         await speaker.start()
 
         await speaker.enqueue("Hello world.")
@@ -36,15 +35,13 @@ class TestTTSSpeakerOutput:
         await speaker.stop()
 
         assert not output_queue.empty()
-        tts.synthesize_async.assert_called_once_with(
-            "Hello world.", "Ryan", "English", ""
-        )
+        tts.synthesize_async.assert_called_once_with("Hello world.", "af_heart")
 
     @pytest.mark.asyncio
     async def test_output_frames_are_48khz_20ms(self):
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         tts = _make_mock_tts(duration_seconds=0.1)
-        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="Ryan")
+        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="af_heart")
         await speaker.start()
 
         await speaker.enqueue("Test sentence.")
@@ -59,7 +56,7 @@ class TestTTSSpeakerOutput:
     async def test_multiple_chunks_processed_in_order(self):
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=1000)
         tts = _make_mock_tts(duration_seconds=0.05)
-        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="Ryan")
+        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="af_heart")
         await speaker.start()
 
         await speaker.enqueue("First.")
@@ -78,14 +75,13 @@ class TestTTSSpeakerCancel:
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         # Slow TTS so items pile up in text queue
         tts = MagicMock()
-        type(tts).sample_rate = PropertyMock(return_value=12500)
 
-        async def slow_synthesize(text, voice, language, instruct):
+        async def slow_synthesize(text, voice):
             await asyncio.sleep(5.0)
-            return np.zeros(1250, dtype=np.int16)
+            return np.zeros(2400, dtype=np.int16)
 
         tts.synthesize_async = slow_synthesize
-        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="Ryan")
+        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="af_heart")
         await speaker.start()
 
         # Enqueue several items — first will block on slow synthesis
@@ -104,7 +100,7 @@ class TestTTSSpeakerCancel:
     async def test_cancel_drains_output_queue(self):
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         tts = _make_mock_tts(duration_seconds=0.1)
-        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="Ryan")
+        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="af_heart")
         await speaker.start()
 
         await speaker.enqueue("Some text.")
@@ -121,7 +117,7 @@ class TestTTSSpeakerCancel:
         """After cancel, new enqueued text should still be processed."""
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         tts = _make_mock_tts(duration_seconds=0.05)
-        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="Ryan")
+        speaker = TTSSpeaker(tts=tts, output_queue=output_queue, voice="af_heart")
         await speaker.start()
 
         await speaker.enqueue("Old speech.")
@@ -153,7 +149,6 @@ class TestTTSSpeakerLifecycle:
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         tts = MagicMock()
         tts.synthesize_async = AsyncMock(return_value=np.array([], dtype=np.int16))
-        type(tts).sample_rate = PropertyMock(return_value=12500)
         speaker = TTSSpeaker(tts=tts, output_queue=output_queue)
         await speaker.start()
 
@@ -167,15 +162,14 @@ class TestTTSSpeakerLifecycle:
     async def test_synthesis_exception_does_not_crash_worker(self):
         output_queue: asyncio.Queue[AudioFrame] = asyncio.Queue(maxsize=500)
         tts = MagicMock()
-        type(tts).sample_rate = PropertyMock(return_value=12500)
         call_count = 0
 
-        async def failing_then_ok(text, voice, language, instruct):
+        async def failing_then_ok(text, voice):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise RuntimeError("TTS crashed")
-            return np.zeros(1250, dtype=np.int16)
+                raise RuntimeError("Kokoro crashed")
+            return np.zeros(2400, dtype=np.int16)
 
         tts.synthesize_async = failing_then_ok
         speaker = TTSSpeaker(tts=tts, output_queue=output_queue)

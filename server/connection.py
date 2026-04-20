@@ -5,7 +5,6 @@ from contextlib import suppress
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
-from server.config import settings
 from server.llm.client import LLMClient
 from server.llm.conversation import ConversationManager
 from server.metrics import LatencyTracker
@@ -14,7 +13,7 @@ from server.pipeline.listening import ListeningProcessor
 from server.pipeline.runner import PipelineRunner
 from server.session import SessionState
 from server.stt.transcriber import WhisperTranscriber
-from server.tts.synthesizer import Qwen3TTS, TTSSpeaker
+from server.tts.synthesizer import KokoroTTS, TTSSpeaker
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,7 @@ _pipelines: dict[int, PipelineRunner] = {}
 # Shared singletons (loaded on first connection)
 _transcriber: WhisperTranscriber | None = None
 _llm_client: LLMClient | None = None
-_tts_engine: Qwen3TTS | None = None
+_tts_engine: KokoroTTS | None = None
 
 # Per-session state
 _conversations: dict[int, ConversationManager] = {}
@@ -35,6 +34,7 @@ _tts_speakers: dict[int, TTSSpeaker] = {}
 _session_states: dict[int, SessionState] = {}
 _barge_in_filters: dict[int, BargeInFilter] = {}
 _latency_trackers: dict[int, LatencyTracker] = {}
+_system_prompts: dict[int, str | None] = {}
 
 
 async def _get_transcriber() -> WhisperTranscriber:
@@ -55,11 +55,11 @@ async def _get_llm_client() -> LLMClient:
     return _llm_client
 
 
-async def _get_tts_engine() -> Qwen3TTS:
-    """Get or create the shared Qwen3TTS singleton."""
+async def _get_tts_engine() -> KokoroTTS:
+    """Get or create the shared KokoroTTS singleton."""
     global _tts_engine
     if _tts_engine is None:
-        _tts_engine = Qwen3TTS()
+        _tts_engine = KokoroTTS()
         await _tts_engine.start()
     return _tts_engine
 
@@ -102,7 +102,7 @@ async def _execute_barge_in(pc_id: int) -> None:
 
 
 async def create_peer_connection(
-    offer_sdp: str, offer_type: str
+    offer_sdp: str, offer_type: str, *, system_prompt: str | None = None
 ) -> tuple[RTCSessionDescription, int]:
     """Create a new WebRTC peer connection with VAD + STT pipeline.
 
@@ -112,6 +112,7 @@ async def create_peer_connection(
     pc = RTCPeerConnection()
     pc_id = id(pc)
     _peer_connections.add(pc)
+    _system_prompts[pc_id] = system_prompt
     logger.info("Created peer connection %s", pc_id)
 
     @pc.on("connectionstatechange")
@@ -130,7 +131,9 @@ async def create_peer_connection(
             from server.signaling import transcript_queues
 
             # Create per-session state objects
-            conversation = ConversationManager()
+            conversation = ConversationManager(
+                system_prompt=_system_prompts.get(pc_id)
+            )
             _conversations[pc_id] = conversation
 
             session_state = SessionState()
@@ -244,8 +247,6 @@ async def _start_pipeline(
     speaker = TTSSpeaker(
         tts=tts_engine,
         output_queue=pipeline.output_queue,
-        language=settings.tts_language,
-        instruct=settings.tts_instruct,
         on_first_frame=on_first_frame,
         on_playback_done=on_playback_done,
     )
@@ -286,20 +287,27 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
             "LLM request [peer %s]: %d messages in history", pc_id, len(messages)
         )
 
-        async def on_token(token: str) -> None:
+        async def on_chunk(chunk: str) -> None:
             nonlocal accumulated, first_chunk_received
-            accumulated += token
-            await queue.put({"type": "llm_chunk", "text": token})
+            accumulated += chunk
+            await queue.put({"type": "llm_chunk", "text": chunk})
 
             # Record first token time for latency tracking
             if not first_chunk_received:
                 first_chunk_received = True
                 if tracker and tracker.current:
                     tracker.current.llm_first_token = time.perf_counter()
+                # Mark session as speaking on first TTS enqueue
+                if session_state:
+                    session_state.mark_speaking()
+
+            # Feed sentence chunk to TTS for audio synthesis
+            if speaker:
+                await speaker.enqueue(chunk)
 
         full_response = await llm_client.stream_completion(
             messages=messages,
-            on_token=on_token,
+            on_chunk=on_chunk,
             cancel_event=cancel_event,
         )
 
@@ -314,12 +322,9 @@ async def _handle_llm_response(pc_id: int, conversation: ConversationManager) ->
             pc_id, len(full_response), conversation.message_count,
         )
 
-        # Send full response to TTS as a single synthesis call for
-        # coherent prosody across the entire response.
-        if speaker and full_response:
-            if session_state:
-                session_state.mark_speaking()
-            await speaker.enqueue(full_response)
+        # Signal TTS that no more text is coming. The session transitions
+        # to IDLE only after TTS finishes playing all audio (via on_playback_done).
+        if speaker:
             await speaker.enqueue_done()
 
         # Finalize latency tracking
@@ -374,35 +379,13 @@ async def _cleanup_connection(pc: RTCPeerConnection) -> None:
     _session_states.pop(pc_id, None)
     _barge_in_filters.pop(pc_id, None)
     _latency_trackers.pop(pc_id, None)
+    _system_prompts.pop(pc_id, None)
     _peer_connections.discard(pc)
     await pc.close()
     # Clean up transcript queue
     from server.signaling import transcript_queues
     transcript_queues.pop(pc_id, None)
     logger.info("Cleaned up peer connection %s", pc_id)
-
-
-def apply_session_settings(
-    peer_id: int,
-    voice: str | None = None,
-    instruct: str | None = None,
-    system_prompt: str | None = None,
-) -> dict:
-    """Apply runtime settings to a live session."""
-    result: dict[str, str] = {}
-    speaker = _tts_speakers.get(peer_id)
-    if voice is not None and speaker:
-        speaker.set_voice(voice)
-        result["voice"] = voice
-    if instruct is not None and speaker:
-        speaker.set_instruct(instruct)
-        result["instruct"] = instruct
-    if system_prompt is not None:
-        conversation = _conversations.get(peer_id)
-        if conversation:
-            conversation.set_system_prompt(system_prompt)
-            result["system_prompt"] = "updated"
-    return result
 
 
 async def shutdown_all() -> None:
